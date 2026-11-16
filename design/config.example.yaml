@@ -1,0 +1,139 @@
+# RailPilot 配置示例（自研客户端）
+# 安全默认：单账号、扫码登录、Cookie 只存内存、人工支付、只访问 *.12306.cn。
+# 不要在本文件写密码/授权码/Cookie；通知密钥走 DPAPI 或环境变量。
+
+version: 1
+
+app:
+  name: "RailPilot"
+  # 数据目录（默认 E:\RailPilot\data；可用 RAILPILOT_DATA_DIR 覆盖）
+  data_dir: "E:\\RailPilot\\data"
+  theme: "system"            # system | light | dark
+  language: "zh-CN"
+
+account:
+  login_mode: "qr"           # 只支持 qr；不提供 password
+  on_expired: "stop"         # stop | notify | reopen_qr
+
+passengers:
+  # 只写姓名/类型；身份证/手机号留在 12306 账号里，不落本地库
+  - name: "张三"
+    type: "adult"            # adult | child | student
+  - name: "李四"
+    type: "adult"
+
+tasks:
+  - name: "春节回家 北京南→上海虹桥"
+    enabled: true
+    dates: ["2027-02-10", "2027-02-11"]   # 最多 3 个
+    from_station: "北京南"
+    to_station: "上海虹桥"
+    candidates:
+      - train_no: "G1"
+        seats: ["二等座", "一等座"]
+        priority: 1
+      - train_no: "G3"
+        seats: ["二等座"]
+        priority: 2
+    passengers: ["张三"]
+    seat_preference: "A"      # A | F | window | aisle | ""
+    berth_preference: ""      # upper | middle | lower | ""
+    ticket_type: "adult"      # adult | student | child
+
+timing:
+  sync_url: "https://www.12306.cn"
+  sync_samples: 5
+  resync_at: ["T-10m", "T-2m", "T-10s"]
+  sprint_window_ms: 3000
+  first_submit_offset_ms: 80
+  retry_backoff_ms: [150, 250, 400, 600, 900]
+  query_interval_sec: 5
+  query_interval_after_sold_out_sec: 30
+
+waitlist:
+  enabled: true
+  auto_submit: false          # 默认只生成计划/打开官方页面
+  max_orders: 6
+  max_dates_per_order: 3
+  max_combos_per_order: 60
+  max_passengers_per_order: 19
+  cutoff_hours_before_departure: 2
+  accept_new_trains: true
+  new_train_time_range: ["06:00", "22:00"]
+  min_transfer_buffer_min: 30
+  latest_arrival: "23:30"
+  keep_family_together: true
+  elderly_lower_berth: true
+
+safety:
+  max_accounts: 1
+  max_manual_cancels_per_day: 2
+  max_unpaid_orders: 1
+  on_captcha: "stop"
+  on_risk: "cooldown"
+  cooldown_min: 10
+  kill_switch_hotkey: "Ctrl+Alt+Q"
+  # 以下为硬编码红线，配置不可开启
+  allow_multi_account: false
+  allow_proxy: false
+  allow_captcha_bypass: false
+  allow_anti_detect: false
+  allow_auto_pay: false
+  allow_buy_short_ride_long: false
+
+payment:
+  mode: "manual"             # manual | open_page | auto（auto 仅 P2 显式授权）
+  remind_before_min: [10, 5, 2]
+  open_page_after_lock: true
+  auto_pay:
+    enabled: false
+    max_amount: 0
+    daily_limit: 0
+    require_amount_match: true
+
+notifications:
+  desktop: true
+  webhook:
+    enabled: false
+    url_env: "RAILPILOT_WEBHOOK_URL"
+  ntfy:
+    enabled: false
+    topic_env: "RAILPILOT_NTFY_TOPIC"
+  serverchan:
+    enabled: false
+    key_env: "RAILPILOT_SERVERCHAN_KEY"
+  telegram:
+    enabled: false
+    bot_token_env: "RAILPILOT_TELEGRAM_TOKEN"
+    chat_id_env: "RAILPILOT_TELEGRAM_CHAT_ID"
+  # 只发状态/截止；不发姓名/证件号/完整订单号
+  include_name: false
+  include_id: false
+  include_full_order_no: false
+
+security:
+  session_persistence: "memory"      # memory（默认）| dpapi（可选记住登录）
+  # dpapi 模式下，state.enc 的过期时间；到期自动删除
+  session_ttl_hours: 24
+  state_file: "state.enc"
+  dpapi_scope: "user"                # 只允许 user；不要 local_machine
+  delete_state_on_exit: false        # dpapi 模式下是否退出即删
+  temp_profile: true                 # 用临时浏览器上下文；退出即删
+  allowlist:
+    - "12306.cn"
+    - ".12306.cn"
+  block_http: true
+  block_third_party: true
+  log_redaction: true
+  screenshot:
+    enabled: false                   # 默认不保存截图
+    mask_pii: true
+  clear_clipboard_on_exit: true
+  auto_lock_minutes: 10
+
+logging:
+  level: "INFO"
+  file: "railpilot.log"
+  max_mb: 5
+  backup_count: 3
+  log_bodies: false                  # 禁止记录请求/响应体
