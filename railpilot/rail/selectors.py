@@ -10,6 +10,7 @@ ORDER_URL = f"{BASE}/otn/queryOrder/queryMyOrderNoComplete"
 STATION_JS_URL = f"{BASE}/otn/resources/js/framework/station_name.js"
 QUERY_URL = f"{BASE}/otn/leftTicket/queryG"
 INIT_MY_12306_URL = f"{BASE}/otn/index/initMy12306Api"
+CHECK_USER_URL = f"{BASE}/otn/login/checkUser"
 
 # Left-ticket page selectors (used only when a page-based fallback is needed).
 FROM_INPUT = "#fromStationText"

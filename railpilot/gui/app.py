@@ -567,7 +567,8 @@ class LoginPage(BasePage):
             card.body,
             text=(
                 "RailPilot 会打开一个独立的 Edge 窗口；你在普通 Edge 里的登录不会传进来。"
-                "请在那个新窗口里用 12306 App 扫码。程序只等待登录态，不支付、不下单。"
+                "请在那个新窗口里用 12306 App 扫码，并在手机上点“确认登录”（可能需要人脸/短信验证）。"
+                "程序只等待登录态，不支付、不下单。"
             ),
             bg=COLORS["card"],
             fg=COLORS["muted"],
@@ -586,6 +587,8 @@ class LoginPage(BasePage):
             fg=COLORS["amber"],
             font=FONT_SMALL,
             anchor="w",
+            justify="left",
+            wraplength=760,
         )
         self.blocked.pack(fill="x", pady=(10, 0))
 
@@ -622,19 +625,25 @@ class LoginPage(BasePage):
             try:
                 adapter.open()
                 ok = adapter.login_qr(timeout_s=180)
-                return ok, list(adapter.blocked_hosts)
+                probe = adapter.login_probe()
+                return ok, list(adapter.blocked_hosts), probe
             finally:
                 adapter.close()
 
         def done(payload):
-            ok, blocked = payload
+            ok, blocked, probe = payload
             if ok:
                 self.status.configure(text="已登录（会话仅内存，退出即失效）。", fg=COLORS["success"])
                 self.app.record("LOGIN_OK", "QR login success")
             else:
                 self.status.configure(text="未完成扫码或已超时。", fg=COLORS["amber"])
                 self.app.record("LOGIN_TIMEOUT", "QR login timeout")
-            self.blocked.configure(text=("已拦截：" + ", ".join(blocked)) if blocked else "")
+            detail = ""
+            if probe:
+                detail = f"检测：checkUser={probe.get('check_user')}；cookie={','.join(probe.get('cookies') or []) or '无'}"
+            self.blocked.configure(
+                text=(("已拦截：" + ", ".join(blocked)) if blocked else "") + (("\n" + detail) if detail else "")
+            )
 
         def failed(exc):
             self.status.configure(text=f"登录失败：{exc}", fg=COLORS["danger"])

@@ -199,19 +199,92 @@ class PlaywrightAdapter:
         except Exception:
             pass
         try:
+            self._page.evaluate(
+                """() => {
+                    const old = document.getElementById('railpilot-login-banner');
+                    if (old) old.remove();
+                    const el = document.createElement('div');
+                    el.id = 'railpilot-login-banner';
+                    el.textContent = 'RailPilot 登录窗口：请只在这个窗口扫码，普通 Edge 的登录不会共享';
+                    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
+                        + 'background:#0b1218;color:#4fd1c5;border-bottom:2px solid #4fd1c5;'
+                        + 'font:14px/1.6 Microsoft YaHei UI,sans-serif;padding:8px 16px;text-align:center;';
+                    document.body.prepend(el);
+                }"""
+            )
             self._page.bring_to_front()
             self._page.evaluate("window.focus()")
         except Exception:
             pass
-        print("请在这个新打开的浏览器窗口里用 12306 App 扫码；普通 Edge 的登录态不会共享。")
+        print("请在这个新窗口用 12306 App 扫码，并在手机点“确认登录”；普通 Edge 的登录态不会共享。")
         deadline = time.monotonic() + timeout_s
+        attempt = 0
         while time.monotonic() < deadline:
-            if self.is_logged_in():
+            # Cookies are cheap; ask checkUser every third poll.
+            if self.is_logged_in(deep=(attempt % 3 == 0)):
                 return True
+            attempt += 1
             self._page.wait_for_timeout(int(poll_s * 1000))
         return False
 
-    def is_logged_in(self) -> bool:
+    def _check_user_in_page(self) -> bool | None:
+        if self._page is None:
+            return None
+        try:
+            result = self._page.evaluate(
+                """async () => {
+                    try {
+                        const r = await fetch('/otn/login/checkUser', {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                      'X-Requested-With': 'XMLHttpRequest'},
+                            body: '_json_att='
+                        });
+                        if (!r.ok) return null;
+                        const j = await r.json();
+                        return Boolean(j && j.data && j.data.flag);
+                    } catch (e) { return null; }
+                }"""
+            )
+            return bool(result) if result is not None else None
+        except Exception:
+            return None
+
+    def login_probe(self) -> dict:
+        """Return non-secret login diagnostics (cookie names, checkUser flag)."""
+        if self._context is None:
+            return {"cookies": [], "check_user": None, "url": ""}
+        try:
+            cookies = self._context.cookies(selectors.BASE)
+        except Exception:
+            cookies = []
+        names = sorted({str(c.get("name")) for c in cookies if c.get("value")})
+        check_user = self._check_user_in_page()
+        if check_user is None:
+            try:
+                assert_allowed(selectors.CHECK_USER_URL)
+                response = self._context.request.post(
+                    selectors.CHECK_USER_URL,
+                    form={"_json_att": ""},
+                    headers={
+                        "Referer": selectors.LEFT_TICKET_URL,
+                        "Origin": selectors.BASE,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                )
+                if "json" in response.headers.get("content-type", ""):
+                    payload = response.json()
+                    check_user = bool((payload.get("data") or {}).get("flag"))
+            except Exception:
+                pass
+        return {
+            "cookies": names,
+            "check_user": check_user,
+            "url": self._page.url if self._page is not None else "",
+        }
+
+    def is_logged_in(self, deep: bool = True) -> bool:
         if self._context is None:
             return False
         try:
@@ -219,7 +292,11 @@ class PlaywrightAdapter:
         except Exception:
             return False
         names = {cookie.get("name") for cookie in cookies if cookie.get("value")}
-        return bool({"tk", "uamtk"} & names)
+        if {"tk", "uamtk"} & names:
+            return True
+        if not deep:
+            return False
+        return bool(self.login_probe().get("check_user"))
 
     def _station_code(self, name: str) -> str:
         if self._station_map is None:
