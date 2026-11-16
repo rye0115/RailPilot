@@ -632,6 +632,10 @@ class LoginPage(BasePage):
 
         def done(payload):
             ok, blocked, probe = payload
+            # checkUser is the authoritative signal; a timeout boundary can
+            # otherwise leave ok=False while the official session is valid.
+            if not ok and probe and probe.get("check_user") is True:
+                ok = True
             if ok:
                 self.status.configure(text="已登录（会话仅内存，退出即失效）。", fg=COLORS["success"])
                 self.app.record("LOGIN_OK", "QR login success")

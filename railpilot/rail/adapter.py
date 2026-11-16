@@ -225,7 +225,9 @@ class PlaywrightAdapter:
                 return True
             attempt += 1
             self._page.wait_for_timeout(int(poll_s * 1000))
-        return False
+        # The scan can complete exactly at the timeout boundary; do one final
+        # authoritative check before reporting failure.
+        return self.is_logged_in(deep=True)
 
     def _check_user_in_page(self) -> bool | None:
         if self._page is None:
