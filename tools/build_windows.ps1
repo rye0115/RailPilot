@@ -1,11 +1,17 @@
 # Build the Windows onedir bundle with PyInstaller.
 # Usage: powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1
+param([ValidateSet("CLI","GUI")][string]$Target = "CLI")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
     throw "missing .venv; create it and install requirements-dev.txt first"
+}
+
+if ($Target -eq "GUI") {
+    & .\.venv\Scripts\python.exe tools\build_desktop.py
+    exit $LASTEXITCODE
 }
 
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --console `

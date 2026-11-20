@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from ..models import Event
-from ..security.redact import redact_text
+from ..security.redact import redact_fields, redact_text
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -35,7 +35,7 @@ class EventStore:
         self._conn.close()
 
     def append(self, event: Event) -> None:
-        meta = json.dumps(event.meta or {}, ensure_ascii=False, sort_keys=True)
+        meta = json.dumps(redact_fields(event.meta or {}), ensure_ascii=False, sort_keys=True)
         self._conn.execute(
             "INSERT INTO events(ts, task_id, code, message, latency_ms, meta_json) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -45,7 +45,7 @@ class EventStore:
                 event.code,
                 redact_text(event.message),
                 event.latency_ms,
-                redact_text(meta),
+                meta,
             ),
         )
         self._conn.commit()
@@ -53,13 +53,13 @@ class EventStore:
     def timeline(self, task_id: str, limit: int = 100) -> list[Event]:
         rows = self._conn.execute(
             "SELECT ts, task_id, code, message, latency_ms, meta_json "
-            "FROM events WHERE task_id = ? ORDER BY id ASC LIMIT ?",
+            "FROM events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
             (task_id, limit),
         ).fetchall()
         result: list[Event] = []
-        for ts, tid, code, message, latency_ms, meta_json in rows:
+        for ts, tid, code, message, latency_ms, meta_json in reversed(rows):
             try:
-                meta = json.loads(meta_json or "{}")
+                meta = redact_fields(json.loads(meta_json or "{}"))
             except json.JSONDecodeError:
                 meta = {}
             result.append(
@@ -67,7 +67,7 @@ class EventStore:
                     ts=ts,
                     task_id=tid,
                     code=code,
-                    message=message,
+                    message=redact_text(message),
                     latency_ms=latency_ms,
                     meta=meta,
                 )

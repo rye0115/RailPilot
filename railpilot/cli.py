@@ -14,12 +14,13 @@ from .core.guard import Guard
 from .core.waitlist import build_plan
 from .models import Task
 from .security.doctor import run_checks
+from .security.redact import RedactingFormatter, safe_exception
 from .store.events import EventStore
 
 
 def _setup_logging() -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    handler.setFormatter(RedactingFormatter("%(levelname)s %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
@@ -98,7 +99,7 @@ def cmd_waitlist(args: argparse.Namespace) -> int:
             latest_arrival=str(config.get("waitlist", {}).get("latest_arrival", "")),
         )
     except Exception as exc:  # noqa: BLE001
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": safe_exception(exc)}, ensure_ascii=False))
         return 1
     print(json.dumps({"ok": True, "plan": plan.to_dict()}, ensure_ascii=False, indent=2))
     return 0
@@ -138,7 +139,7 @@ def cmd_query(args: argparse.Namespace) -> int:
         )
         return 0
     except Exception as exc:  # noqa: BLE001
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": safe_exception(exc)}, ensure_ascii=False))
         return 1
     finally:
         adapter.close()

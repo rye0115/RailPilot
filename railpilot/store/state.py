@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..security import dpapi
-from ..security.files import atomic_write_text, secure_delete
+from ..security.files import atomic_write_text
 
 
 class StateSecurityError(RuntimeError):
@@ -59,4 +59,11 @@ class StateStore:
         atomic_write_text(self.path, protected)
 
     def clear(self) -> None:
-        secure_delete(self.path)
+        if self.path.is_symlink():
+            raise StateSecurityError("不能清理链接指向的文件")
+        if not self.path.exists():
+            return
+        # Authenticate the encrypted JSON before removing the directory entry.
+        # An unlink failure leaves the authenticated file intact for a retry.
+        self.load()
+        self.path.unlink(missing_ok=True)

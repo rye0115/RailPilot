@@ -27,3 +27,11 @@ def test_clock_uses_monotonic_and_offset():
     # 1000s base + 1s offset + 0.5s elapsed = 1001500ms
     assert clock.now_ms() == 1_001_500
     assert clock.remaining_ms(1_002_000) == 500
+
+
+def test_later_samples_do_not_age_the_best_offset(monkeypatch):
+    timestamps = iter([1000.05, 1002.05, 1004.05])
+    samples = iter([(1000.0, .10), (1001.0, 2), (1003.0, 2)])
+    monkeypatch.setattr(time, "time", lambda: next(timestamps))
+    state = calibrate(samples=3, fetcher=lambda url, timeout: next(samples))
+    assert state.offset_ms == 0

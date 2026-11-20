@@ -1,9 +1,10 @@
 from datetime import date
+from unittest.mock import Mock
 
 import pytest
 
 from railpilot.models import Candidate, Order
-from railpilot.rail.adapter import DryRunAdapter, RailError, parse_query_rows, validate_presale_date
+from railpilot.rail.adapter import DryRunAdapter, PlaywrightAdapter, RailError, parse_query_rows, validate_presale_date
 
 
 def test_dry_run_adapter():
@@ -66,3 +67,60 @@ def test_validate_presale_date():
         validate_presale_date("2026-11-29", today=today)
     with pytest.raises(RailError):
         validate_presale_date("2026-11-13", today=today)
+
+
+@pytest.mark.parametrize("payload", [{"status": False, "data": {}}, {"status": True, "data": {}}])
+def test_missing_query_results_raise(payload, monkeypatch):
+    adapter = PlaywrightAdapter()
+    adapter._context = Mock()
+    adapter._page = Mock(url="https://kyfw.12306.cn/otn/leftTicket/init")
+    adapter._page.is_closed.return_value = False
+    adapter._station_map = {"A": "AAA", "B": "BBB"}
+    monkeypatch.setattr("railpilot.rail.adapter.validate_presale_date", lambda _: None)
+    response = adapter._context.request.get.return_value
+    response.ok = True
+    response.json.return_value = payload
+    with pytest.raises(RailError):
+        adapter.query("2027-02-10", "A", "B")
+    response.json.return_value = {"status": True, "data": {"result": []}}
+    assert adapter.query("2027-02-10", "A", "B") == []
+
+
+def test_orders_require_explicit_list_and_known_filtered_status(monkeypatch):
+    adapter = PlaywrightAdapter()
+    adapter._context = Mock()
+    monkeypatch.setattr(adapter, "is_logged_in", lambda: True)
+    response = adapter._context.request.post.return_value
+    response.ok = True
+    response.headers = {"content-type": "application/json"}
+    for data in ({}, {"orderDBList": None}, {"orderDBList": [{}]}):
+        response.json.return_value = {"status": True, "data": data}
+        with pytest.raises(RailError):
+            adapter.read_orders("unpaid")
+    response.json.return_value = {"status": True, "data": {"orderDBList": []}}
+    assert adapter.read_orders("unpaid") == []
+    response.json.return_value = {"status": True, "httpstatus": 200, "messages": [], "data": None}
+    assert adapter.read_orders() == []
+    response.json.return_value = {"status": True, "data": {"to_page": "cache", "orderDBList": []}}
+    with pytest.raises(RailError, match="排队"):
+        adapter.read_orders()
+
+
+def test_closed_work_tab_preserves_other_tabs():
+    adapter = PlaywrightAdapter()
+    adapter._browser = Mock()
+    booking = Mock()
+    adapter._context = Mock(pages=[booking])
+    adapter._page = Mock()
+    adapter._page.is_closed.return_value = True
+
+    assert adapter.is_open()
+    work = adapter._work_page()
+    assert work is not booking
+    assert work is adapter._context.new_page.return_value
+    work.is_closed.return_value = False
+    assert adapter._work_page() is work
+    adapter._context.new_page.assert_called_once()
+    booking.goto.assert_not_called()
+    adapter._context.pages = []
+    assert not adapter.is_open()

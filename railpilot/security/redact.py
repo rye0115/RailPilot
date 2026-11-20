@@ -9,12 +9,14 @@ from __future__ import annotations
 import logging
 import re
 
-_COOKIE = re.compile(r"(?i)(\bcookie\b\s*[:=]\s*)[^\r\n]+")
+_COOKIE = re.compile(r"(?i)(\b(?:set-cookie|cookie)\b[\"']?\s*[:=]\s*)[^\r\n]+")
+_SECRET_KEYS = {"cookie", "set-cookie", "tk", "uamtk", "rail_deviceid", "rail_expiration",
+                "token", "access_token", "refresh_token", "sessionid", "authorization"}
 _TOKEN = re.compile(
-    r"(?i)(\b(?:tk|uamtk|RAIL_DEVICEID|RAIL_EXPIRATION|token|sessionid|authorization)\b"
-    r"\s*[:=]\s*)[\"']?[^\"'\s;,]+"
+    r"(?i)(\b(?:" + "|".join(map(re.escape, sorted(_SECRET_KEYS))) +
+    r")\b[\"']?\s*[:=]\s*[\"']?)(?:(?:Bearer|Basic)\s+)?[^\"'\s;,}]+"
 )
-_MAINLAND_ID = re.compile(r"(?<!\d)(\d{6})\d{8}(\d{4})(?!\d)")
+_MAINLAND_ID = re.compile(r"(?<!\d)(\d{6})\d{8}(\d{3}[\dXx])(?!\d)")
 _PHONE = re.compile(r"(?<!\d)(1\d{2})\d{4}(\d{4})(?!\d)")
 _ORDER_NO = re.compile(r"\b([Ee])\d{8,}\b")
 
@@ -45,6 +47,20 @@ def redact_text(value: object) -> str:
     text = _PHONE.sub(lambda m: f"{m.group(1)}****{m.group(2)}", text)
     text = _ORDER_NO.sub(lambda m: f"{m.group(1)}{'*' * 8}{m.group(0)[-4:]}", text)
     return text
+
+
+def redact_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>" if str(key).lower() in _SECRET_KEYS else redact_fields(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_fields(item) for item in value]
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        masked = redact_text(value)
+        return masked if masked != str(value) else value
+    return value
 
 
 class RedactingFormatter(logging.Formatter):

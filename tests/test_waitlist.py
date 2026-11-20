@@ -76,3 +76,18 @@ def test_latest_arrival_filter():
 def test_no_feasible_candidates():
     with pytest.raises(WaitlistError):
         build_plan([], [Passenger("张三")], "2027-02-10T18:00:00+08:00")
+
+
+@pytest.mark.parametrize("cutoff", ["abc", "2027-02-10", "2027-02-10T18:00:00"])
+def test_rejects_invalid_cutoff(cutoff):
+    with pytest.raises(WaitlistError, match="截止时间"):
+        build_plan([_candidate("2027-02-10", "G1", "二等座")], [Passenger("P")], cutoff)
+
+
+def test_reports_only_actual_overflow():
+    candidates = [_candidate("2027-02-10", f"G{i}", "二等座") for i in range(361)]
+    args = ([Passenger("P")], "2027-02-10T12:00:00+08:00")
+    assert build_plan(candidates[:360], *args).warnings == []
+    plan = build_plan(candidates, *args)
+    assert plan.total_combos == 360
+    assert "1 个" in plan.warnings[0]

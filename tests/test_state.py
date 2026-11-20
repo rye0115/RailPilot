@@ -33,3 +33,11 @@ def test_clear(tmp_path):
     assert path.exists()
     store.clear()
     assert not path.exists()
+
+
+def test_clear_preserves_unrelated_file(tmp_path):
+    path = tmp_path / "notes.txt"
+    path.write_text("notes", encoding="utf-8")
+    with pytest.raises(StateSecurityError):
+        StateStore(path).clear()
+    assert path.read_text(encoding="utf-8") == "notes"

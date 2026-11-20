@@ -1,6 +1,6 @@
 # 12306 私人购票助手：调研、参考算法与安全方案
 
-> 调研/审计截止：2026-11-14 · 仓库：`E:\DSH-Data\projects\12306` · 状态：v0.1 安全内核 + 查询/候补/护栏已实现，真实下单未启用
+> 当前桌面版 v0.2.0，支持本机保存行程、扫码预订和订单核对。以下竞品调研记录于 2026-11-14。
 
 ## 结论
 
@@ -28,25 +28,33 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-> 真实下单未启用；`run` 只做 dry-run。现场测试步骤见 `docs/09-implementation-status.md`。
+> CLI 的 `run` 为演练入口。桌面版的真实单次提交需要在「我的行程」单独确认。
 
 ### Windows GUI 客户端
 
-已打包，双击即可：
+本次更新的 Windows 桌面版可直接双击运行。
 
 ```text
-dist\RailPilotGUI\RailPilotGUI.exe
+dist\RailPilot-20261120\RailPilotGUI\RailPilotGUI.exe
 ```
 
-便携包：`dist\RailPilotGUI-v0.1-win64-E.zip`（约 55MB）。
+便携包为 `dist\RailPilotGUI-v0.2.0-win64.zip`。完整解压后打开其中的 `RailPilotGUI.exe`。
 
 本地数据默认存 `E:\RailPilot\data`；可用环境变量 `RAILPILOT_DATA_DIR` 覆盖。
 
-界面包含：总览、查票、候补、登录、安全、日志。查票使用真实浏览器，候补只生成计划，真实下单默认关闭。
+在「查票」选中车次，点击「加入行程」勾选席别。可以继续查询其他日期，随后在「我的行程」调整优先顺序、填写乘车人和当日最晚到达时间。点击「刷新余票」可按同行人数检查各项余票。
+
+扫码后，选择「跟踪手动预订」会先记录当前订单，再带你到官方页面提交。提交后点「核对订单」查看新待支付订单和官方支付期限。网络异常显示「待核实」。重启后重新扫码可继续核对。若只需浏览，点「打开官网预订」可直接进入官方页面。
+
+「有票时提交一次」需确认具体成人票行程及等待分钟数。程序依据保存的优先顺序低频查票，匹配后核对官方表单并记录单次提交。超时、重启或重复点击都不会自动重发。付款由你完成。此流程以本地模拟订单验证，实际账号扫码及真实订单由旅客现场验证。
+
+Windows 下运行 `.\tools\build_windows.ps1 -Target GUI` 可执行全量测试、打包、启动验证和归档。升级沿用已有安装目录并保留其中的 `config.yaml`，便携包仅含示例配置。
+
+查票表按发车时间排列，并显示查询结果中出现的席别。点击「生成候补」会导入选中车次的全部席别。未选中车次时，会导入当前筛选可见的车次。在候补页可以切回配置任务。
 
 ### Windows CLI 版
 
-已打包：`dist/RailPilot/RailPilot.exe`（约 135MB，含 Playwright 驱动），压缩包 `dist/RailPilot-v0.1-win64.zip`（约 52MB）。
+如果需要独立命令行版，可运行 `tools/build_windows.ps1 -Target CLI`，生成 `dist/RailPilot/RailPilot.exe`。
 
 在 `dist/RailPilot` 目录打开 PowerShell：
 

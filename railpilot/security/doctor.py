@@ -8,7 +8,6 @@ from pathlib import Path
 from ..config import ConfigError, load_config
 from ..security import dpapi
 from ..security.allowlist import is_allowed_url
-from ..security.files import secure_delete
 from ..store.state import StateStore
 
 
@@ -44,7 +43,7 @@ def run_checks(config_path: str | Path | None = None) -> dict:
             store.save({"version": 1, "probe": "x"})
             checks["state_roundtrip"] = store.load().get("probe") == "x"
             checks["state_ciphertext"] = path.read_text(encoding="utf-8").startswith(dpapi.PREFIX)
-            secure_delete(path)
+            store.clear()
             checks["state_delete"] = not path.exists()
         except Exception as exc:  # noqa: BLE001
             checks["state_roundtrip"] = False

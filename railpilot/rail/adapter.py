@@ -2,9 +2,7 @@
 
 `DryRunAdapter` is deterministic and used by tests/CLI dry-runs.
 `PlaywrightAdapter` opens the official pages in a real browser and keeps
-cookies in memory. Live order submission is intentionally not enabled in v0.1:
-the order flow needs field testing against the real page before it can be
-trusted.
+cookies in memory. The desktop's single confirmed booking flow is in checkout.py.
 """
 
 from __future__ import annotations
@@ -12,18 +10,29 @@ from __future__ import annotations
 import re
 import time
 from datetime import date as date_cls, datetime, timedelta, timezone
-from typing import Iterable
+from collections.abc import Callable, Iterable
+from urllib.parse import urlencode
 
 from ..models import Candidate, Order, SubmitResult, WaitlistPlan
 from ..security.allowlist import assert_allowed, install_route_guard
-from ..security.redact import mask_order_no
 from . import selectors
+from .orders import parse_order
 
 CN = timezone(timedelta(hours=8))
 
 
 class RailError(RuntimeError):
     pass
+
+
+def _response_rows(payload: object, key: str, label: str) -> list:
+    if not isinstance(payload, dict) or payload.get("status") is not True:
+        raise RailError(f"{label}失败，请稍后在 12306 核对")
+    data = payload.get("data")
+    rows = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise RailError(f"{label}返回的数据不完整，无法确认结果")
+    return rows
 
 
 def validate_presale_date(date_str: str, today: date_cls | None = None) -> None:
@@ -131,7 +140,7 @@ class DryRunAdapter:
     def open_payment(self, order: Order) -> None:
         return None
 
-    def open_waitlist(self, plan: WaitlistPlan) -> None:
+    def open_waitlist(self, plan: WaitlistPlan | None = None) -> None:
         return None
 
 
@@ -147,7 +156,11 @@ class PlaywrightAdapter:
         self.blocked_hosts: list[str] = []
 
     def __enter__(self) -> "PlaywrightAdapter":
-        self.open()
+        try:
+            self.open()
+        except Exception:
+            self.close()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -169,8 +182,8 @@ class PlaywrightAdapter:
             viewport={"width": 1280, "height": 900},
         )
         install_route_guard(self._context, self._on_block)
+        self._context.set_default_timeout(self.timeout_ms)
         self._page = self._context.new_page()
-        self._page.set_default_timeout(self.timeout_ms)
 
     def _on_block(self, host: str) -> None:
         if host not in self.blocked_hosts:
@@ -190,10 +203,21 @@ class PlaywrightAdapter:
                 pass
         self._pw = self._browser = self._context = self._page = None
 
-    def login_qr(self, timeout_s: int = 180, poll_s: float = 2.0) -> bool:
-        if self._page is None:
+    def is_open(self) -> bool:
+        return bool(self._browser and self._browser.is_connected() and self._context and self._context.pages)
+
+    def _work_page(self):
+        if self._context is None:
             raise RailError("adapter is not open")
-        self._page.goto(selectors.LOGIN_URL, wait_until="domcontentloaded")
+        if self._page is None or self._page.is_closed():
+            # Other tabs may contain an unfinished booking. Give queries and QR login their own page.
+            self._page = self._context.new_page()
+        return self._page
+
+    def login_qr(self, timeout_s: int = 180, poll_s: float = 2.0,
+                 cancelled: Callable[[], bool] | None = None) -> bool:
+        page = self._work_page()
+        page.goto(selectors.LOGIN_URL, wait_until="domcontentloaded")
         try:
             self._page.locator("a", has_text="扫码登录").first.click(timeout=3000)
         except Exception:
@@ -216,12 +240,12 @@ class PlaywrightAdapter:
             self._page.evaluate("window.focus()")
         except Exception:
             pass
-        print("请在这个新窗口用 12306 App 扫码，并在手机点“确认登录”；普通 Edge 的登录态不会共享。")
         deadline = time.monotonic() + timeout_s
         attempt = 0
         while time.monotonic() < deadline:
-            # Cookies are cheap; ask checkUser every third poll.
-            if self.is_logged_in(deep=(attempt % 3 == 0)):
+            if cancelled and cancelled():
+                return False
+            if attempt % 3 == 0 and self.is_logged_in():
                 return True
             attempt += 1
             self._page.wait_for_timeout(int(poll_s * 1000))
@@ -245,7 +269,7 @@ class PlaywrightAdapter:
                         });
                         if (!r.ok) return null;
                         const j = await r.json();
-                        return Boolean(j && j.data && j.data.flag);
+                        return j?.data?.flag === true;
                     } catch (e) { return null; }
                 }"""
             )
@@ -277,7 +301,7 @@ class PlaywrightAdapter:
                 )
                 if "json" in response.headers.get("content-type", ""):
                     payload = response.json()
-                    check_user = bool((payload.get("data") or {}).get("flag"))
+                    check_user = (payload.get("data") or {}).get("flag") is True
             except Exception:
                 pass
         return {
@@ -289,16 +313,14 @@ class PlaywrightAdapter:
     def is_logged_in(self, deep: bool = True) -> bool:
         if self._context is None:
             return False
+        if deep:
+            return self.login_probe().get("check_user") is True
         try:
             cookies = self._context.cookies(selectors.BASE)
         except Exception:
             return False
         names = {cookie.get("name") for cookie in cookies if cookie.get("value")}
-        if {"tk", "uamtk"} & names:
-            return True
-        if not deep:
-            return False
-        return bool(self.login_probe().get("check_user"))
+        return bool({"tk", "uamtk"} & names)
 
     def _station_code(self, name: str) -> str:
         if self._station_map is None:
@@ -319,11 +341,10 @@ class PlaywrightAdapter:
         return code
 
     def query(self, date: str, from_station: str, to_station: str) -> list[Candidate]:
-        if self._context is None or self._page is None:
-            raise RailError("adapter is not open")
         validate_presale_date(date)
-        if "leftTicket" not in (self._page.url or ""):
-            self._page.goto(selectors.LEFT_TICKET_URL, wait_until="domcontentloaded")
+        page = self._work_page()
+        if "leftTicket" not in (page.url or ""):
+            page.goto(selectors.LEFT_TICKET_URL, wait_until="domcontentloaded")
         from_code = self._station_code(from_station)
         to_code = self._station_code(to_station)
         url = (
@@ -344,7 +365,9 @@ class PlaywrightAdapter:
             content_type = response.headers.get("content-type", "")
             hint = "date may be outside the 15-day presale window" if "text/html" in content_type else "login/risk page?"
             raise RailError(f"query returned non-JSON ({hint})") from exc
-        rows = payload.get("data", {}).get("result", []) or []
+        rows = _response_rows(payload, "result", "余票查询")
+        if any(not isinstance(row, str) or len(row.split("|")) < 34 for row in rows):
+            raise RailError("余票记录格式异常，无法确认余票")
         return parse_query_rows(rows, date, from_station, to_station, from_code, to_code)
 
     def submit(self, candidate: Candidate) -> SubmitResult:
@@ -358,7 +381,7 @@ class PlaywrightAdapter:
         if self._context is None:
             raise RailError("adapter is not open")
         if not self.is_logged_in():
-            raise RailError("not logged in; refusing to guess order state")
+            raise RailError("请先在登录页完成 12306 扫码，再核对订单。")
         assert_allowed(selectors.ORDER_URL)
         response = self._context.request.post(
             selectors.ORDER_URL,
@@ -366,51 +389,78 @@ class PlaywrightAdapter:
             headers={"Referer": f"{selectors.BASE}/otn/queryOrder/initNoComplete"},
         )
         content_type = response.headers.get("content-type", "")
+        if not response.ok:
+            raise RailError(f"订单查询 HTTP {response.status}")
         if "json" not in content_type:
             raise RailError("order endpoint returned HTML; login/risk page")
         try:
             payload = response.json()
         except Exception as exc:  # noqa: BLE001
             raise RailError("order endpoint returned invalid JSON") from exc
-        if not payload.get("status", False):
-            raise RailError("order query failed")
-        data = payload.get("data") or {}
-        if not isinstance(data, dict):
-            raise RailError("order endpoint returned unexpected data shape")
-        rows = data.get("orderDBList") or []
+        if isinstance(payload, dict) and payload.get("status") is True and "data" in payload:
+            data = payload["data"]
+            if data in (None, "") and not payload.get("messages") and payload.get("httpstatus", 200) == 200:
+                return []
+            if isinstance(data, dict) and data.get("to_page") == "cache":
+                raise RailError("官方订单正在排队或处理中，请稍后核对。")
+        rows = _response_rows(payload, "orderDBList", "订单查询")
+        payment_list = payload["data"].get("to_page") == "db"
         result: list[Order] = []
         for row in rows:
             if not isinstance(row, dict):
+                raise RailError("订单记录格式异常，请在 12306 核对")
+            order = parse_order(row, payment_list=payment_list)
+            if status is not None and order.status == "unknown":
+                raise RailError("订单状态无法识别，请在 12306 核对")
+            if status is not None and order.status != status:
                 continue
-            raw_no = str(row.get("order_no") or row.get("orderId") or "")
-            raw_status = str(row.get("status") or row.get("order_status") or "")
-            mapped = "unknown"
-            if raw_status in ("未支付", "待支付", "unpaid"):
-                mapped = "unpaid"
-            elif raw_status in ("已支付", "paid"):
-                mapped = "paid"
-            elif raw_status in ("已取消", "cancelled"):
-                mapped = "cancelled"
-            if status is not None and mapped != status:
-                continue
-            result.append(
-                Order(
-                    masked_no=mask_order_no(raw_no),
-                    status=mapped,  # type: ignore[arg-type]
-                    amount=row.get("ticket_price") or row.get("amount"),
-                    pay_deadline=row.get("pay_limit_time") or row.get("pay_deadline"),
-                    train_no=row.get("train_code") or row.get("train_no"),
-                    date=row.get("train_date") or row.get("date"),
-                )
-            )
+            result.append(order)
         return result
+
+    def booking_results_page(self, candidate: Candidate):
+        date, from_station, to_station = candidate.date, candidate.from_station, candidate.to_station
+        validate_presale_date(date)
+        params = urlencode({
+            "linktypeid": "dc",
+            "fs": f"{from_station},{self._station_code(from_station)}",
+            "ts": f"{to_station},{self._station_code(to_station)}",
+            "date": date,
+            "flag": "N,N,Y",
+        }, safe=",")
+        return self._open_official_tab(f"{selectors.LEFT_TICKET_URL}?{params}")
+
+    def open_booking(self, candidate: Candidate) -> bool:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+        page = self.booking_results_page(candidate)
+        train = page.locator("#queryLeftTable").get_by_text(candidate.train_no, exact=True).first
+        try:
+            train.scroll_into_view_if_needed(timeout=5000)
+            train.focus(timeout=1000)
+        except PlaywrightTimeout:
+            return False
+        return True
+
+    def _open_official_tab(self, url: str):
+        if self._context is None:
+            raise RailError("adapter is not open")
+        assert_allowed(url)
+        page = self._context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            page.bring_to_front()
+            return page
+        except Exception:
+            page.close()
+            raise
+
+    def open_orders(self) -> None:
+        self._open_official_tab(f"{selectors.BASE}/otn/queryOrder/initNoComplete")
 
     def open_payment(self, order: Order) -> None:
         if self._page is None:
             raise RailError("adapter is not open")
-        self._page.goto(f"{selectors.BASE}/otn/queryOrder/initNoComplete", wait_until="domcontentloaded")
+        self.open_orders()
 
-    def open_waitlist(self, plan: WaitlistPlan) -> None:
-        if self._page is None:
-            raise RailError("adapter is not open")
-        self._page.goto(selectors.LEFT_TICKET_URL, wait_until="domcontentloaded")
+    def open_waitlist(self, plan: WaitlistPlan | None = None) -> None:
+        self._open_official_tab(selectors.LEFT_TICKET_URL)

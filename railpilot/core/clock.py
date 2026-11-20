@@ -35,6 +35,7 @@ def _fetch_http_date(url: str, timeout: float = 5.0) -> tuple[float, float]:
         with urlopen(request, timeout=timeout, context=context) as response:  # nosec B310: URL is assert_allowed()
             date_header = response.headers.get("Date")
     except Exception:
+        started = time.monotonic()
         request = Request(url, method="GET", headers={"User-Agent": "RailPilot/0.1"})
         with urlopen(request, timeout=timeout, context=context) as response:  # nosec B310: URL is assert_allowed()
             date_header = response.headers.get("Date")
@@ -59,10 +60,11 @@ def calibrate(
     best: tuple[float, float] | None = None
     for _ in range(samples):
         server_epoch, rtt = fetch(url, timeout)
+        offset = server_epoch + rtt / 2 - time.time()
         if best is None or rtt < best[1]:
-            best = (server_epoch, rtt)
+            best = (offset, rtt)
     assert best is not None
-    offset_ms = int(round((best[0] + best[1] / 2 - time.time()) * 1000))
+    offset_ms = int(round(best[0] * 1000))
     return ClockState(
         offset_ms=offset_ms,
         measured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),

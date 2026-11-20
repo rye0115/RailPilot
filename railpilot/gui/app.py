@@ -17,25 +17,30 @@ import sys
 import threading
 import time
 import tkinter as tk
-import webbrowser
-from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from ..config import ConfigError, events_path, load_config, state_path
+from ..config import ConfigError, data_dir, events_path, load_config, state_path
+from .. import __version__
 from ..core.waitlist import build_plan
 from ..models import Candidate, Event, Task, utc_now_iso
-from ..rail.adapter import PlaywrightAdapter, validate_presale_date
+from ..rail.adapter import validate_presale_date
+from ..rail.selectors import SEAT_NAMES
 from ..security.doctor import run_checks
-from ..security.files import app_data_dir
+from ..security.redact import safe_exception
 from ..store.events import EventStore
 from ..store.state import StateStore
 from .theme import COLORS, FONT_H1, FONT_H2, FONT_LABEL, FONT_MONO, FONT_SMALL, FONT_TITLE, FONT_UI, apply_theme
+from .session import DesktopSession
+from .journey import JourneyPage
 from .widgets import Card, FlatButton, NavButton, Pill, StatCard, divider
 
 NAV_ITEMS = [
     ("dashboard", "总览"),
     ("query", "查票"),
+    ("journey", "我的行程"),
     ("waitlist", "候补"),
     ("login", "登录"),
     ("security", "安全"),
@@ -102,7 +107,7 @@ class DashboardPage(BasePage):
         tk.Label(self, text="总览", bg=COLORS["bg"], fg=COLORS["text"], font=FONT_H1, anchor="w").pack(fill="x")
         tk.Label(
             self,
-            text="先把时间和候选算准，再把提交和候补交给系统；真实下单默认关闭。",
+            text="在查票页添加备选车次，再到「我的行程」确认乘车人、预订并核对订单。",
             bg=COLORS["bg"],
             fg=COLORS["muted"],
             font=FONT_LABEL,
@@ -113,10 +118,10 @@ class DashboardPage(BasePage):
         stats.pack(fill="x")
         self.stat_tasks = StatCard(stats, "任务", "0", "配置中的行程")
         self.stat_candidates = StatCard(stats, "候选", "0", "日期 × 车次 × 席别")
-        self.stat_cancel = StatCard(stats, "今日取消", "0/2", "留一次余量")
+        self.stat_booking = StatCard(stats, "我的备选", "0", "已保存的车次和席别")
         self.stat_security = StatCard(stats, "安全", "DPAPI", "会话默认不落盘")
         for index, card in enumerate(
-            (self.stat_tasks, self.stat_candidates, self.stat_cancel, self.stat_security)
+            (self.stat_tasks, self.stat_candidates, self.stat_booking, self.stat_security)
         ):
             card.grid(row=0, column=index, padx=(0, 12) if index < 3 else 0, sticky="nsew")
             stats.grid_columnconfigure(index, weight=1)
@@ -171,7 +176,7 @@ class DashboardPage(BasePage):
             ("login", "扫码登录（不存密码）"),
             ("session", "会话默认只存内存"),
             ("allowlist", "只访问 *.12306.cn"),
-            ("order", "真实下单未启用"),
+            ("order", "单次提交须先确认具体行程"),
         ):
             line = tk.Frame(security_card.body, bg=COLORS["card"])
             line.pack(fill="x", pady=5)
@@ -197,8 +202,7 @@ class DashboardPage(BasePage):
         tasks = self.app.tasks
         self.stat_tasks.set(str(len(tasks)), "配置中的行程")
         self.stat_candidates.set(str(sum(len(t.candidates) for t in tasks)), "日期 × 车次 × 席别")
-        max_cancel = int(self.app.cfg.get("safety", {}).get("max_manual_cancels_per_day", 2))
-        self.stat_cancel.set(f"0/{max_cancel}", "留一次余量")
+        self.stat_booking.set(str(len(self.app.pages["journey"].trip.choices)), "已保存的车次和席别")
         self.stat_security.set("DPAPI", "会话默认不落盘")
         if not tasks:
             self.task_name.configure(text="—")
@@ -224,7 +228,7 @@ class QueryPage(BasePage):
         tk.Label(self, text="查票", bg=COLORS["bg"], fg=COLORS["text"], font=FONT_H1, anchor="w").pack(fill="x")
         tk.Label(
             self,
-            text="官方余票页，真实浏览器；只读查询，不登录、不下单。",
+            text="查询官方余票，选中车次后可前往 12306 确认乘车人、席别和订单。",
             bg=COLORS["bg"],
             fg=COLORS["muted"],
             font=FONT_LABEL,
@@ -249,7 +253,7 @@ class QueryPage(BasePage):
             _field(row, label, var, width=width).pack(side="left", padx=(0, 12))
         check = tk.Checkbutton(
             row,
-            text="无头浏览器",
+            text="独立查票时隐藏浏览器",
             variable=self.headless_var,
             bg=COLORS["card"],
             fg=COLORS["muted"],
@@ -291,21 +295,27 @@ class QueryPage(BasePage):
         )
         self.count_label.pack(side="left", padx=(12, 0))
         FlatButton(toolbar, "生成候补", variant="secondary", command=self.to_waitlist).pack(side="right")
-        FlatButton(toolbar, "打开官方页", variant="ghost", command=self.open_official).pack(side="right", padx=(0, 8))
+        FlatButton(toolbar, "加入行程", command=self.add_to_journey).pack(side="right", padx=(0, 5))
+        FlatButton(toolbar, "打开官网预订", command=self.open_official).pack(side="right", padx=(0, 8))
 
-        columns = ("date", "train", "dep", "arr", "second", "first", "business", "status")
-        headings = ("日期", "车次", "出发", "到达", "二等座", "一等座", "商务座", "状态")
-        widths = (96, 80, 64, 64, 80, 80, 80, 110)
-        self.tree = ttk.Treeview(results.body, columns=columns, show="headings", height=14)
+        self._seats = tuple(dict.fromkeys(("二等座", "一等座", "商务座", *SEAT_NAMES)))
+        columns = ("date", "train", "dep", "arr", *self._seats, "status")
+        headings = ("日期", "车次", "出发", "到达", *self._seats, "状态")
+        widths = (96, 80, 64, 64, *(76 for _ in self._seats), 90)
+        self.tree = ttk.Treeview(results.body, columns=columns, show="headings", height=14, selectmode="browse")
         for column, heading, width in zip(columns, headings, widths):
             self.tree.heading(column, text=heading)
-            self.tree.column(column, width=width, anchor="center")
+            self.tree.column(column, width=width, minwidth=width, anchor="center")
         self.tree.tag_configure("odd", background=COLORS["card2"])
         scroll = ttk.Scrollbar(results.body, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(results.body, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        horizontal.pack(side="bottom", fill="x")
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.results: list[Candidate] = []
+        self._row_candidates: dict[str, list[Candidate]] = {}
+        self.populate()
 
     def query(self) -> None:
         date_text = self.date_var.get().strip()
@@ -320,17 +330,9 @@ class QueryPage(BasePage):
             messagebox.showwarning("查票", str(exc))
             return
         headless = bool(self.headless_var.get())
-        self.query_button.configure(state="disabled", text="查询中…")
-        self.status.configure(text="正在打开官方页面并查询，请稍候…", fg=COLORS["amber"])
-        self.app.record("QUERY_START", f"{date_text} {from_text}->{to_text}")
 
         def work():
-            adapter = PlaywrightAdapter(headless=headless)
-            try:
-                adapter.open()
-                return adapter.query(date_text, from_text, to_text), list(adapter.blocked_hosts)
-            finally:
-                adapter.close()
+            return self.app.session.query(date_text, from_text, to_text, headless)
 
         def done(payload):
             results, blocked = payload
@@ -341,54 +343,113 @@ class QueryPage(BasePage):
             self.app.record("QUERY_OK", note)
 
         def failed(exc):
-            self.status.configure(text=f"查询失败：{exc}", fg=COLORS["danger"])
+            self.status.configure(text=f"查询失败：{safe_exception(exc)}", fg=COLORS["danger"])
             self.app.record("QUERY_ERROR", str(exc))
 
-        self.app.run_async(work, done, failed, on_done=lambda: self.query_button.configure(state="normal", text="查询余票"))
+        if self.app.run_async(work, done, failed, on_done=lambda: self.query_button.configure(state="normal", text="查询余票")):
+            self.results = []
+            self.populate()
+            self.query_button.configure(state="disabled", text="查询中…")
+            self.status.configure(text="正在查询官方余票…", fg=COLORS["amber"])
+            self.app.record("QUERY_START", f"{date_text} {from_text}->{to_text}")
 
     def populate(self) -> None:
-        for row in self.tree.get_children():
-            self.tree.delete(row)
+        self.tree.delete(*self.tree.get_children())
+        self._row_candidates.clear()
         needle = self.filter_var.get().strip().lower()
-        grouped: dict[tuple[str, str, str, str], dict[str, str]] = {}
+        grouped: dict[tuple[str, str, str, str], list[Candidate]] = {}
+        seat_types: set[str] = set()
         for candidate in self.results:
             if needle and needle not in candidate.train_no.lower():
                 continue
-            key = (candidate.date, candidate.train_no, candidate.depart_time, candidate.arrive_time)
-            row = grouped.setdefault(key, {})
-            row[candidate.seat] = candidate.available
-        shown = 0
-        for key, seats in sorted(grouped.items()):
-            date_text, train_no, depart, arrive = key
-            status = "可订" if any(value and value not in ("无", "候补") for value in seats.values()) else "—"
-            self.tree.insert(
+            key = (candidate.date, candidate.depart_time, candidate.train_no, candidate.arrive_time)
+            grouped.setdefault(key, []).append(candidate)
+            seat_types.add(candidate.seat)
+        visible_seats = [seat for seat in self._seats if seat in seat_types] or self._seats[:3]
+        self.tree.configure(displaycolumns=("date", "train", "dep", "arr", *visible_seats, "status"))
+        for index, ((date_text, depart, train_no, arrive), candidates) in enumerate(sorted(grouped.items())):
+            seats = {c.seat: c.available for c in candidates}
+            status = "待核对"
+            if any(v == "有" or (v.isdecimal() and int(v) > 0) for v in seats.values()):
+                status = "可订"
+            elif "候补" in seats.values():
+                status = "候补"
+            elif all(v in ("0", "无", "--", "*", "") for v in seats.values()):
+                status = "暂无余票"
+            row = self.tree.insert(
                 "",
                 "end",
-                values=(
-                    date_text,
-                    train_no,
-                    depart,
-                    arrive,
-                    seats.get("二等座", "—") or "—",
-                    seats.get("一等座", "—") or "—",
-                    seats.get("商务座", "—") or "—",
-                    status,
-                ),
-                tags=("odd",) if shown % 2 else (),
+                values=(date_text, train_no, depart, arrive, *(seats.get(s, "—") for s in self._seats), status),
+                tags=("odd",) if index % 2 else (),
             )
-            shown += 1
-        self.count_label.configure(text=f"显示 {shown} 趟 / {len(self.results)} 条席别")
+            self._row_candidates[row] = candidates
+        shown_seats = sum(len(group) for group in grouped.values())
+        self.count_label.configure(text=f"显示 {len(grouped)} 趟 / {shown_seats} 条席别")
 
     def to_waitlist(self) -> None:
-        if not self.results:
-            messagebox.showinfo("候补", "先查询余票，或直接在候补页使用配置任务。")
+        rows = self.tree.selection() or self.tree.get_children()
+        if not rows:
+            messagebox.showinfo("候补", "当前没有可导入的车次，请先查询或调整筛选。")
             return
-        self.app.query_results = list(self.results)
+        candidates = [c for row in rows for c in self._row_candidates[row]]
+        self.app.waitlist_page.import_candidates(candidates)
         self.app.show_page("waitlist")
-        self.app.waitlist_page.set_source("query")
+
+    def add_to_journey(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("加入行程", "先在结果中选中一趟车。", parent=self)
+            return
+        choices = self._row_candidates[selection[0]]
+        first = choices[0]
+        window = tk.Toplevel(self)
+        window.title("选择可接受的席别")
+        window.transient(self.app)
+        window.configure(bg=COLORS["card"])
+        tk.Label(window, text=f"{first.date}  {first.train_no}  {first.from_station} → {first.to_station}",
+                 bg=COLORS["card"], fg=COLORS["text"], font=FONT_LABEL).pack(padx=18, pady=12)
+        options = []
+        for c in choices:
+            value = tk.BooleanVar(window)
+            ttk.Checkbutton(window, text=f"{c.seat} · {c.available}", variable=value).pack(anchor="w", padx=18)
+            options.append((value, c))
+        def add():
+            selected = [c for value, c in options if value.get()]
+            if not selected:
+                messagebox.showinfo("席别", "请选择至少一个席别。", parent=window)
+                return
+            try:
+                self.app.pages["journey"].add_choices(selected)
+            except Exception as exc:
+                messagebox.showerror("加入行程", safe_exception(exc), parent=window)
+                return
+            window.destroy()
+            self.app.show_page("journey")
+        FlatButton(window, "保存到行程", command=add).pack(padx=18, pady=12)
+        window.grab_set()
 
     def open_official(self) -> None:
-        webbrowser.open("https://kyfw.12306.cn/otn/leftTicket/init")
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("预订", "请先在查询结果中选中一趟车。")
+            return
+        candidate = self._row_candidates[selection[0]][0]
+
+        def open_booking():
+            return self.app.session.visible_browser().open_booking(candidate)
+
+        def done(found):
+            note = (
+                f"已定位 {candidate.train_no}。请在 12306 确认席别和乘车人，提交后到登录页核对待支付订单。"
+                if found else f"请在 12306 复查 {candidate.train_no}，当前页面尚未找到该车次。"
+            )
+            self.status.configure(text=note, fg=COLORS["text"] if found else COLORS["amber"])
+
+        self.app.run_async(
+            open_booking,
+            done,
+            lambda exc: messagebox.showerror("预订", safe_exception(exc)),
+        )
 
 
 class WaitlistPage(BasePage):
@@ -413,22 +474,28 @@ class WaitlistPage(BasePage):
         tk.Label(box, text="任务", bg=COLORS["card"], fg=COLORS["muted"], font=FONT_SMALL, anchor="w").pack(fill="x")
         self.task_combo = ttk.Combobox(box, textvariable=self.task_var, state="readonly", width=28)
         self.task_combo.pack(fill="x", pady=(4, 0))
+        self.task_combo.bind("<<ComboboxSelected>>", lambda _: self._set_default_cutoff(self.task_combo.current()))
         self.cutoff_var = tk.StringVar()
         _field(row, "截止兑现（ISO8601）", self.cutoff_var, width=30).pack(side="left", padx=(0, 12))
         FlatButton(row, "生成候补计划", command=self.generate).pack(side="left", pady=(18, 0))
         FlatButton(row, "打开官方页", variant="ghost", command=self.open_official).pack(side="left", padx=(8, 0), pady=(18, 0))
-        self.source_label = tk.Label(
-            form.body,
-            text="数据源：配置任务",
-            bg=COLORS["card"],
-            fg=COLORS["muted"],
-            font=FONT_SMALL,
-            anchor="w",
-        )
-        self.source_label.pack(fill="x", pady=(10, 0))
+        self.source = tk.StringVar(value="config")
+        sources = tk.Frame(form.body, bg=COLORS["card"])
+        sources.pack(fill="x", pady=(10, 0))
+        for label, value in (("配置任务", "config"), ("已导入的查票结果", "query")):
+            button = tk.Radiobutton(
+                sources, text=label, variable=self.source, value=value,
+                command=lambda: self._set_default_cutoff(self.task_combo.current()),
+                bg=COLORS["card"], fg=COLORS["text"], selectcolor=COLORS["card2"],
+                activebackground=COLORS["card"], activeforeground=COLORS["text"],
+            )
+            button.pack(side="left")
+            if value == "query":
+                self.imported_button = button
+                button.configure(state="disabled")
         self.status = tk.Label(
             form.body,
-            text="官方候补提交仍需你在 12306 页面确认；预付款 30 分钟内完成。",
+            text="生成计划后，请在 12306 确认候补需求和预付款期限。",
             bg=COLORS["card"],
             fg=COLORS["amber"],
             font=FONT_SMALL,
@@ -469,12 +536,28 @@ class WaitlistPage(BasePage):
         self.detail.insert("1.0", "生成计划后，这里显示可直接核对的 JSON。")
         self.detail.configure(state="disabled")
         self.plan = None
-        self._source = "config"
+        self.imported_candidates: list[Candidate] = []
+        self.cutoff_var.trace_add("write", lambda *_: self._clear_plan())
 
-    def set_source(self, source: str) -> None:
-        self._source = source
-        self.source_label.configure(text="数据源：当前查票结果" if source == "query" else "数据源：配置任务")
-        self.refresh()
+    def import_candidates(self, candidates: list[Candidate]) -> None:
+        self.imported_candidates = candidates
+        self.source.set("query")
+        first = candidates[0]
+        trains = len({c.train_no for c in candidates})
+        self.imported_button.configure(
+            state="normal", text=f"查票结果 · {first.date} {first.from_station} → {first.to_station}（{trains} 趟）"
+        )
+        self._set_default_cutoff(self.task_combo.current())
+
+    def _clear_plan(self) -> None:
+        if self.plan is None:
+            return
+        self.plan = None
+        self.tree.delete(*self.tree.get_children())
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.configure(state="disabled")
+        self.status.configure(text="条件已更改，请重新生成候补计划。", fg=COLORS["amber"])
 
     def refresh(self) -> None:
         names = [task.name for task in self.app.tasks]
@@ -484,6 +567,21 @@ class WaitlistPage(BasePage):
             self._set_default_cutoff(0)
 
     def _set_default_cutoff(self, index: int) -> None:
+        self._clear_plan()
+        if self.source.get() == "query" and self.imported_candidates:
+            try:
+                earliest = min(
+                    datetime.fromisoformat(f"{c.date}T{c.depart_time}+08:00")
+                    for c in self.imported_candidates if c.depart_time
+                )
+                hours = float(self.app.cfg.get("waitlist", {}).get("cutoff_hours_before_departure", 2))
+                if hours < 0:
+                    raise ValueError("negative cutoff interval")
+                self.cutoff_var.set((earliest - timedelta(hours=hours)).isoformat())
+            except (ValueError, TypeError, OverflowError):
+                self.cutoff_var.set("")
+                self.status.configure(text="无法推算截止时间，请手动填写。", fg=COLORS["amber"])
+            return
         if 0 <= index < len(self.app.tasks):
             first = sorted(self.app.tasks[index].dates)[0]
             self.cutoff_var.set(f"{first}T18:00:00+08:00")
@@ -497,7 +595,7 @@ class WaitlistPage(BasePage):
         except tk.TclError:
             index = 0
         task = self.app.tasks[index]
-        candidates = self.app.query_results if self._source == "query" and self.app.query_results else task.candidates
+        candidates = self.imported_candidates if self.source.get() == "query" else task.candidates
         if not candidates:
             messagebox.showinfo("候补", "没有可用候选。")
             return
@@ -531,13 +629,17 @@ class WaitlistPage(BasePage):
         self.detail.insert("1.0", text)
         self.detail.configure(state="disabled")
         self.status.configure(
-            text=f"已生成 {len(plan.orders)} 单 / {plan.total_combos} 组合；请到官方页确认提交。",
-            fg=COLORS["success"],
+            text=f"已生成 {len(plan.orders)} 单 / {plan.total_combos} 组合。" + " ".join(plan.warnings),
+            fg=COLORS["amber"] if plan.warnings else COLORS["success"],
         )
         self.app.record("WAITLIST_PLAN", f"orders={len(plan.orders)} combos={plan.total_combos}")
 
     def open_official(self) -> None:
-        webbrowser.open("https://kyfw.12306.cn/otn/leftTicket/init")
+        self.app.run_async(
+            lambda: self.app.session.visible_browser().open_waitlist(),
+            lambda _: self.status.configure(text="请在 12306 页面选择车次和席别，确认候补需求。", fg=COLORS["text"]),
+            lambda exc: messagebox.showerror("候补", safe_exception(exc)),
+        )
 
 
 class LoginPage(BasePage):
@@ -580,6 +682,10 @@ class LoginPage(BasePage):
         self.detail.pack(fill="x", pady=(8, 14))
         self.button = FlatButton(card.body, "打开扫码登录", command=self.login)
         self.button.pack(anchor="w")
+        actions = tk.Frame(card.body, bg=COLORS["card"])
+        actions.pack(anchor="w", pady=(6, 0))
+        FlatButton(actions, "核对官方待支付订单", variant="secondary", command=self.open_orders).pack(side="left")
+        FlatButton(actions, "结束浏览器会话", variant="ghost", command=self.logout).pack(side="left", padx=6)
         self.blocked = tk.Label(
             card.body,
             text="",
@@ -621,23 +727,12 @@ class LoginPage(BasePage):
         self.app.record("LOGIN_START", "QR login window opened")
 
         def work():
-            adapter = PlaywrightAdapter(headless=False)
-            try:
-                adapter.open()
-                ok = adapter.login_qr(timeout_s=180)
-                probe = adapter.login_probe()
-                return ok, list(adapter.blocked_hosts), probe
-            finally:
-                adapter.close()
+            return self.app.session.login(self.app.stopping.is_set)
 
         def done(payload):
             ok, blocked, probe = payload
-            # checkUser is the authoritative signal; a timeout boundary can
-            # otherwise leave ok=False while the official session is valid.
-            if not ok and probe and probe.get("check_user") is True:
-                ok = True
             if ok:
-                self.status.configure(text="已登录（会话仅内存，退出即失效）。", fg=COLORS["success"])
+                self.status.configure(text="扫码已确认，预订和核对订单可沿用此窗口。关闭浏览器会结束会话。", fg=COLORS["success"])
                 self.app.record("LOGIN_OK", "QR login success")
             else:
                 self.status.configure(text="未完成扫码或已超时。", fg=COLORS["amber"])
@@ -650,7 +745,7 @@ class LoginPage(BasePage):
             )
 
         def failed(exc):
-            self.status.configure(text=f"登录失败：{exc}", fg=COLORS["danger"])
+            self.status.configure(text=f"登录失败：{safe_exception(exc)}", fg=COLORS["danger"])
             self.app.record("LOGIN_ERROR", str(exc))
 
         self.app.run_async(
@@ -659,6 +754,20 @@ class LoginPage(BasePage):
             failed,
             on_done=lambda: self.button.configure(state="normal", text="打开扫码登录"),
         )
+
+    def open_orders(self) -> None:
+        self.app.run_async(
+            lambda: self.app.session.visible_browser().open_orders(),
+            lambda _: self.status.configure(text="请在官方页面核对待支付订单和支付截止时间。", fg=COLORS["text"]),
+            lambda exc: messagebox.showerror("订单", safe_exception(exc)),
+        )
+
+    def logout(self) -> None:
+        def done(_):
+            self.status.configure(text="本机浏览器会话已结束。", fg=COLORS["text"])
+            self.blocked.configure(text="")
+
+        self.app.run_async(self.app.session.close, done, lambda exc: messagebox.showerror("结束会话", safe_exception(exc)))
 
 
 CHECK_LABELS = {
@@ -697,7 +806,7 @@ class SecurityPage(BasePage):
 
         data = Card(self, title="本地数据")
         data.pack(fill="x", pady=(14, 0))
-        path = str(app_data_dir())
+        path = str(data_dir(self.app.cfg))
         tk.Label(data.body, text=path, bg=COLORS["card"], fg=COLORS["text"], font=FONT_MONO, anchor="w").pack(fill="x")
         tk.Label(
             data.body,
@@ -710,13 +819,13 @@ class SecurityPage(BasePage):
         row = tk.Frame(data.body, bg=COLORS["card"])
         row.pack(fill="x")
         FlatButton(row, "打开目录", variant="secondary", command=self.app.open_data_dir).pack(side="left")
-        FlatButton(row, "清理登录状态", variant="danger", command=self.clear_state).pack(side="left", padx=(8, 0))
+        FlatButton(row, "清理加密状态文件", variant="danger", command=self.clear_state).pack(side="left", padx=(8, 0))
 
-        boundary = Card(self, title="不做")
+        boundary = Card(self, title="购票与支付")
         boundary.pack(fill="x", pady=(14, 0))
         tk.Label(
             boundary.body,
-            text="不保存密码 · 不自动支付 · 不多账号 · 不代理 · 不验证码识别 · 不自动下单",
+            text="本人扫码登录 · 单次提交需要确认 · 付款在官方页面完成",
             bg=COLORS["card"],
             fg=COLORS["muted"],
             font=FONT_SMALL,
@@ -761,9 +870,13 @@ class SecurityPage(BasePage):
         self.app.record("SECURITY_CHECK", "PASS" if result["ok"] else "FAIL")
 
     def clear_state(self) -> None:
-        if not messagebox.askyesno("清理登录状态", "删除本机 DPAPI 状态文件？这会清除任务/会话，不会影响 12306 账号。", parent=self):
+        if not messagebox.askyesno("清理加密状态文件", "确定删除保存在本机加密状态文件中的数据？", parent=self):
             return
-        StateStore(state_path(self.app.cfg)).clear()
+        try:
+            StateStore(state_path(self.app.cfg)).clear()
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("清理本机状态文件", safe_exception(exc), parent=self)
+            return
         self.app.record("STATE_CLEAR", "local state deleted")
         messagebox.showinfo("安全", "本地状态已删除。")
 
@@ -815,7 +928,7 @@ class LogsPage(BasePage):
 class RailPilotApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("RailPilot · 12306 私人购票助手")
+        self.title(f"RailPilot {__version__} · 12306 购票助手")
         self.minsize(980, 680)
         apply_theme(self)
         self.update_idletasks()
@@ -830,13 +943,14 @@ class RailPilotApp(tk.Tk):
         self.cfg: dict = {}
         self.cfg_error = ""
         self.tasks: list[Task] = []
-        self.query_results: list[Candidate] = []
         self._load_config()
         self._queue: queue.Queue = queue.Queue()
-        self._worker: threading.Thread | None = None
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="railpilot-browser")
+        self.session = DesktopSession()
+        self.stopping = threading.Event()
         self.busy = False
         self._build_shell()
-        self._show_page("dashboard")
+        self._show_page("journey" if self.pages["journey"].active else "query")
         self._tick()
         self.after(80, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -882,7 +996,7 @@ class RailPilotApp(tk.Tk):
         bottom = tk.Frame(sidebar, bg=COLORS["sidebar"])
         bottom.pack(side="bottom", fill="x", padx=20, pady=18)
         tk.Label(bottom, text="●  数据仅本机", bg=COLORS["sidebar"], fg=COLORS["success"], font=FONT_SMALL, anchor="w").pack(fill="x")
-        tk.Label(bottom, text="v0.1 · 真实下单未启用", bg=COLORS["sidebar"], fg=COLORS["muted"], font=FONT_SMALL, anchor="w").pack(
+        tk.Label(bottom, text=f"v{__version__} · 人工支付", bg=COLORS["sidebar"], fg=COLORS["muted"], font=FONT_SMALL, anchor="w").pack(
             fill="x", pady=(4, 0)
         )
 
@@ -935,6 +1049,7 @@ class RailPilotApp(tk.Tk):
         self.pages: dict[str, BasePage] = {
             "dashboard": DashboardPage(self),
             "query": QueryPage(self),
+            "journey": JourneyPage(self),
             "waitlist": WaitlistPage(self),
             "login": LoginPage(self),
             "security": SecurityPage(self),
@@ -987,36 +1102,34 @@ class RailPilotApp(tk.Tk):
 
     def _tick(self) -> None:
         self.clock_label.configure(text=time.strftime("%Y-%m-%d  %H:%M:%S"))
+        self.pages["journey"].tick(time.monotonic())
         self.after(1000, self._tick)
 
-    def run_async(self, fn, on_success, on_error, on_done=None) -> None:
+    def run_async(self, fn, on_success, on_error, on_done=None) -> bool:
         if self.busy:
             messagebox.showinfo("RailPilot", "已有任务在运行，请稍候。")
-            return
+            return False
         self.busy = True
 
         def runner():
             try:
                 result = fn()
             except Exception as exc:  # noqa: BLE001
-                self._queue.put(("error", exc, on_error, on_done))
+                self._queue.put((exc, on_error, on_done))
             else:
-                self._queue.put(("ok", result, on_success, on_done))
+                self._queue.put((result, on_success, on_done))
 
-        self._worker = threading.Thread(target=runner, daemon=True)
-        self._worker.start()
+        self._worker.submit(runner)
+        return True
 
     def _poll_queue(self) -> None:
         try:
-            kind, payload, callback, on_done = self._queue.get_nowait()
+            payload, callback, on_done = self._queue.get_nowait()
         except queue.Empty:
             self.after(80, self._poll_queue)
             return
         try:
-            if kind == "ok":
-                callback(payload)
-            else:
-                callback(payload)
+            callback(payload)
         finally:
             self.busy = False
             if on_done is not None:
@@ -1041,21 +1154,24 @@ class RailPilotApp(tk.Tk):
     def run_clock(self) -> None:
         from ..core.clock import calibrate
 
-        self.record("CLOCK_START", "calibrating")
-        try:
-            state = calibrate(
+        def work():
+            return calibrate(
                 url=str(self.cfg.get("timing", {}).get("sync_url", "https://www.12306.cn")),
                 samples=int(self.cfg.get("timing", {}).get("sync_samples", 5)),
             )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("校时", f"失败：{exc}")
-            return
-        self.record("CLOCK_OK", f"offset={state.offset_ms}ms rtt={state.min_rtt_ms}ms")
-        messagebox.showinfo("校时", f"偏移 {state.offset_ms} ms\n最小 RTT {state.min_rtt_ms} ms")
+
+        def done(state):
+            self.record("CLOCK_OK", f"offset={state.offset_ms}ms rtt={state.min_rtt_ms}ms")
+            messagebox.showinfo("校时", f"偏移 {state.offset_ms} ms\n最小 RTT {state.min_rtt_ms} ms")
+
+        if self.run_async(work, done, lambda exc: messagebox.showerror("校时", safe_exception(exc))):
+            self.record("CLOCK_START", "calibrating")
 
     def open_data_dir(self) -> None:
         try:
-            os.startfile(str(app_data_dir()))  # type: ignore[attr-defined]
+            path = data_dir(self.cfg)
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("打开目录", str(exc))
 
@@ -1063,6 +1179,14 @@ class RailPilotApp(tk.Tk):
         if self.busy and not messagebox.askyesno("退出", "还有任务在运行，确定退出？"):
             return
         self.destroy()
+
+    def destroy(self) -> None:
+        self.stopping.set()
+        self.pages["journey"].stop.set()
+        if self.busy or self.session.has_session:
+            self._worker.submit(self.session.close)
+        self._worker.shutdown(wait=False)
+        super().destroy()
 
 
 def enable_dpi_awareness() -> None:

@@ -1,3 +1,4 @@
+import base64
 import sys
 
 import pytest
@@ -22,6 +23,8 @@ def test_refuses_plaintext():
 
 def test_tampered_blob_fails():
     cipher = dpapi.protect_text("railpilot")
-    tampered = cipher[:-2] + ("AA" if not cipher.endswith("AA") else "BB")
+    blob = bytearray(base64.b64decode(cipher.removeprefix(dpapi.PREFIX)))
+    blob[-1] ^= 1
+    tampered = dpapi.PREFIX + base64.b64encode(blob).decode("ascii")
     with pytest.raises(dpapi.DpapiError):
         dpapi.unprotect_text(tampered)

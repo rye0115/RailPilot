@@ -130,6 +130,16 @@ class SubmitResult:
 
 
 @dataclass(frozen=True)
+class OrderTicket:
+    date: str
+    train_no: str
+    from_station: str
+    to_station: str
+    seat: str
+    passenger: str
+
+
+@dataclass(frozen=True)
 class Order:
     masked_no: str
     status: OrderStatus
@@ -137,6 +147,9 @@ class Order:
     pay_deadline: str | None = None  # ISO8601
     train_no: str | None = None
     date: str | None = None
+    identity: str = ""
+    tickets: tuple[OrderTicket, ...] = ()
+    placed_at: str | None = None
 
 
 @dataclass(frozen=True)

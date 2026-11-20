@@ -7,7 +7,7 @@ version: 1
 app:
   name: "RailPilot"
   # 数据目录（默认 E:\RailPilot\data；可用 RAILPILOT_DATA_DIR 覆盖）
-  data_dir: "E:\\RailPilot\\data"
+  data_dir: ""
   theme: "system"            # system | light | dark
   language: "zh-CN"
 

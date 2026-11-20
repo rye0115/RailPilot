@@ -1,6 +1,6 @@
 [project]
 name = "railpilot"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local-first, security-focused 12306 assistant"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pyinstaller>=6,<7; sys_platform == 'win32'"]
 
 [project.scripts]
 railpilot = "railpilot.cli:main"
@@ -19,3 +19,13 @@ railpilot-gui = "railpilot.gui.app:main"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "railpilot.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["railpilot*"]

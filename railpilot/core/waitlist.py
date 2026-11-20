@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime
 
 from ..models import Candidate, Passenger, WaitlistCombo, WaitlistOrder, WaitlistPlan
 from .planner import feasible
@@ -44,8 +45,12 @@ def build_plan(
 ) -> WaitlistPlan:
     if not passengers:
         raise WaitlistError("at least one passenger is required")
-    if not cutoff_at:
-        raise WaitlistError("cutoff_at is required")
+    try:
+        cutoff = datetime.fromisoformat(cutoff_at)
+    except (TypeError, ValueError) as exc:
+        raise WaitlistError("截止时间须为含时区的日期时间，例如 2027-02-10T18:00:00+08:00") from exc
+    if cutoff.tzinfo is None:
+        raise WaitlistError("截止时间必须包含时区，例如 +08:00")
     if max_orders < 1 or max_dates_per_order < 1 or max_combos_per_order < 1:
         raise WaitlistError("limits must be positive")
 
@@ -76,9 +81,6 @@ def build_plan(
         group = [c for c in clean if c.date in date_set]
         for combo_group in _chunks(group, max_combos_per_order):
             for pax_group in passenger_groups:
-                if len(orders) >= max_orders:
-                    warnings.append("order limit reached; lower-priority combinations were dropped")
-                    break
                 orders.append(
                     WaitlistOrder(
                         index=len(orders) + 1,
@@ -95,6 +97,8 @@ def build_plan(
                         passengers=[p.name for p in pax_group],
                     )
                 )
+                if len(orders) >= max_orders:
+                    break
             if len(orders) >= max_orders:
                 break
         if len(orders) >= max_orders:
@@ -103,9 +107,13 @@ def build_plan(
     if not orders:
         raise WaitlistError("no orders could be built from candidates")
 
+    total_combos = sum(len(order.combos) for order in orders)
+    dropped = len(clean) * len(passenger_groups) - total_combos
+    if dropped:
+        warnings.append(f"已达 {max_orders} 单上限，有 {dropped} 个乘客组与车次席别组合未纳入计划。")
     plan = WaitlistPlan(
         orders=orders,
-        total_combos=sum(len(order.combos) for order in orders),
+        total_combos=total_combos,
         cutoff_at=cutoff_at,
         accept_new_trains=accept_new_trains,
         warnings=warnings,

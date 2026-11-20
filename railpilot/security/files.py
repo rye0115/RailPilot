@@ -27,7 +27,12 @@ def _data_root() -> Path:
 
 def app_data_dir() -> Path:
     path = _data_root()
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        return path
     try:
         os.chmod(path, 0o700)
     except OSError:

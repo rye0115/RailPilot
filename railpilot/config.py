@@ -66,7 +66,7 @@ def load_config(path: str | Path) -> dict:
 
 def data_dir(config: dict) -> Path:
     configured = str(config.get("app", {}).get("data_dir") or "").strip()
-    if not configured:
+    if os.environ.get("RAILPILOT_DATA_DIR", "").strip() or not configured:
         return app_data_dir()
     path = Path(configured).expanduser()
     legacy = Path(os.environ.get("LOCALAPPDATA", "")) / "RailPilot"
@@ -77,7 +77,15 @@ def data_dir(config: dict) -> Path:
 
 
 def state_path(config: dict) -> Path:
-    return data_dir(config) / str(config.get("security", {}).get("state_file", "state.enc"))
+    root = data_dir(config).resolve()
+    name = config.get("security", {}).get("state_file", "state.enc")
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError("状态文件名不能为空")
+    path = root / name
+    resolved = path.resolve()
+    if resolved == root or not resolved.is_relative_to(root) or path.is_symlink():
+        raise ConfigError("状态文件必须位于应用数据目录内")
+    return resolved
 
 
 def events_path(config: dict) -> Path:

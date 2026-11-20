@@ -1,4 +1,8 @@
-# 09 · 实现状态（v0.1）
+# 09 · 实现状态
+
+桌面版 v0.2.0 支持保存多个备选、跟踪手动预订、确认后单次提交和重启后核对订单。已用本地模拟订单验证，真实账号由使用者扫码验收。当前版本的启动方式见项目 README。
+
+## v0.1 历史记录
 
 > 日期：2026-11-14 · 状态：安全内核 + 查询/候补/护栏可用；**真实下单未启用**。
 
@@ -78,7 +82,7 @@ blocked_hosts=["g.alicdn.com"]（登录滑块/CDN 被白名单拦截）
 - 数据目录默认 `E:\RailPilot\data`（可用 `RAILPILOT_DATA_DIR` 覆盖；无 E 盘时回退 `%LOCALAPPDATA%\RailPilot`）。
 - `StateStore` 写出的 `state.enc` 是 `dpapi1:` 密文；`strings` 不含明文姓名。
 - 读到明文 JSON 会抛 `StateSecurityError`，不会静默接受。
-- `StateStore` 清理由 `secure_delete` 覆盖后删除。
+- 清理加密状态时，客户端校验目录、解密并检查文件格式，然后删除文件。删除失败会在界面提示。
 - 本机 DPAPI roundtrip：通过；密文不含明文；篡改后解密失败。
 - 本仓库 `security_scan.ps1`：0 HIGH。
 - 官方查询时白名单拦截 `g.alicdn.com`，说明第三方请求确实被挡住。
